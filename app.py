@@ -7,28 +7,37 @@ app = FastAPI()
 @app.get("/proxy")
 async def proxy(request: Request, url: str = Query(...)):
     try:
-        # Forward all headers, especially "Range"
+        # Pass Range header if present (for audio/video streaming)
         forward_headers = {}
         if "range" in request.headers:
             forward_headers["range"] = request.headers["range"]
 
         async with httpx.AsyncClient() as client:
             async with client.stream("GET", url, headers=forward_headers) as remote:
-                # Forward status and all range/audio-relevant headers
+                # Build response headers up front *before* streaming
                 response_headers = {
                     "Content-Type": remote.headers.get("content-type", "application/octet-stream"),
                     "Access-Control-Allow-Origin": "*",
                 }
-                # Pass through Accept-Ranges, Content-Range, Content-Length if present
+                # Forward range-related headers if present
                 for h in ["accept-ranges", "content-range", "content-length", "content-disposition"]:
-                    if h in remote.headers:
-                        response_headers[h.capitalize() if h != "content-disposition" else "Content-Disposition"] = remote.headers[h]
+                    if remote.headers.get(h) is not None:
+                        # Capitalize as needed for Content-Length, etc.
+                        proper_header = h.title() if h != "content-disposition" else "Content-Disposition"
+                        response_headers[proper_header] = remote.headers[h]
 
                 if remote.status_code >= 400:
                     content = await remote.aread()
                     return Response(content, status_code=remote.status_code, headers=response_headers)
-                return StreamingResponse(remote.aiter_bytes(), headers=response_headers, status_code=remote.status_code)
+
+                # Stream the response WHILE the context is open!
+                return StreamingResponse(
+                    remote.aiter_bytes(),
+                    status_code=remote.status_code,
+                    headers=response_headers
+                )
     except Exception as e:
+        print(f"Proxy error: {e}")  # Log to Render dashboard
         return JSONResponse(
             content={"error": str(e)},
             status_code=500,
