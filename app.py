@@ -1,8 +1,58 @@
-from fastapi import FastAPI, Query, Request, Response
+# app.py
+
+from fastapi import FastAPI, Query, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+import os
+import random
 
 app = FastAPI()
+
+# --- Start: New code for YouTube Proxy ---
+
+# Read comma-separated keys from an environment variable on Render.
+API_KEYS_STR = os.environ.get("YOUTUBE_API_KEYS", "")
+YOUTUBE_API_KEYS = [key.strip() for key in API_KEYS_STR.split(',') if key.strip()]
+
+@app.get("/youtube/v3/{endpoint:path}")
+async def youtube_proxy(endpoint: str, request: Request):
+    """
+    Proxies requests to the YouTube Data API v3, securely adding an API key on the server-side.
+    """
+    if not YOUTUBE_API_KEYS:
+        raise HTTPException(status_code=500, detail="YouTube API keys are not configured on the server.")
+
+    query_params = dict(request.query_params)
+    
+    # Use a shuffled list of keys to try them in a random order.
+    keys_to_try = random.sample(YOUTUBE_API_KEYS, len(YOUTUBE_API_KEYS))
+    
+    async with httpx.AsyncClient() as client:
+        for api_key in keys_to_try:
+            query_params['key'] = api_key
+            youtube_api_url = f"https://www.googleapis.com/youtube/v3/{endpoint}"
+            
+            try:
+                response = await client.get(youtube_api_url, params=query_params, timeout=10.0)
+                
+                # If status is 403 (Forbidden), it's a key quota issue. Try the next key.
+                if response.status_code == 403:
+                    print(f"API key ending in ...{api_key[-4:]} failed with 403. Trying next key.")
+                    continue
+                
+                # For any other status code, return the response directly to the client.
+                # This includes successful responses (2xx) and other errors (4xx/5xx).
+                return Response(content=response.content, status_code=response.status_code, media_type=response.headers.get('content-type'))
+
+            except httpx.RequestError as e:
+                print(f"Error contacting YouTube API: {e}")
+                raise HTTPException(status_code=502, detail=f"Bad Gateway: Could not contact YouTube API. {e}")
+
+    # If the loop finishes, all keys returned 403.
+    raise HTTPException(status_code=403, detail="All available YouTube API keys have exceeded their quota.")
+
+# --- End: New code for YouTube Proxy ---
+
 
 @app.get("/proxy")
 async def proxy(request: Request, url: str = Query(...)):
@@ -11,23 +61,16 @@ async def proxy(request: Request, url: str = Query(...)):
     It streams the content, keeping the connection to the source open
     until the client has received the entire file.
     """
-    # We create a client that will be used for the request.
     client = httpx.AsyncClient()
 
     try:
-        # Prepare the headers for the request to the remote server.
-        # We forward the 'range' header if it exists, which is crucial for streaming audio/video.
         forward_headers = {}
         if "range" in request.headers:
             forward_headers["range"] = request.headers["range"]
 
-        # Manually build and send the request to be able to handle the response stream.
-        # Using stream=True tells httpx to not load the whole response body into memory.
         req = client.build_request("GET", url, headers=forward_headers, timeout=None)
         remote_response = await client.send(req, stream=True)
 
-        # Prepare the headers for the response we will send to our client.
-        # We copy essential headers from the remote server's response.
         response_headers = {
             "Content-Type": remote_response.headers.get("content-type", "application/octet-stream"),
             "Access-Control-Allow-Origin": "*",
@@ -36,30 +79,21 @@ async def proxy(request: Request, url: str = Query(...)):
             if h in remote_response.headers:
                 response_headers[h] = remote_response.headers[h]
 
-        # If the remote server returned an error (like 404 Not Found),
-        # we read the error message and return a regular response, not a stream.
         if remote_response.status_code >= 400:
             error_content = await remote_response.aread()
             await remote_response.aclose()
             await client.aclose()
             return Response(content=error_content, status_code=remote_response.status_code, headers=response_headers)
 
-        # This is the core of the solution. We create an async generator
-        # that yields chunks of the file. FastAPI will iterate over this.
         async def body_iterator():
             try:
-                # Yield each chunk of data as we receive it from the remote server.
                 async for chunk in remote_response.aiter_bytes():
                     yield chunk
             finally:
-                # This 'finally' block is guaranteed to run when the stream is finished
-                # or if the client disconnects. We close our connections here.
                 await remote_response.aclose()
                 await client.aclose()
                 print("Cleaned up remote response and client.")
 
-        # Return a StreamingResponse. It will consume our async generator.
-        # The connection will be kept alive until the generator is exhausted.
         return StreamingResponse(
             body_iterator(),
             status_code=remote_response.status_code,
@@ -67,13 +101,11 @@ async def proxy(request: Request, url: str = Query(...)):
         )
 
     except httpx.RequestError as e:
-        # Handle network-level errors during connection to the remote server.
         print(f"Upstream request error: {e}")
         await client.aclose()
         return JSONResponse(content={"error": f"Failed to connect to upstream server: {e}"}, status_code=502) # 502 Bad Gateway
     
     except Exception as e:
-        # Handle any other unexpected errors.
         print(f"An unexpected proxy error occurred: {e}")
         if not client.is_closed:
             await client.aclose()
