@@ -14,10 +14,12 @@ app = FastAPI()
 # allowing your website to make requests to the proxy.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins, you could restrict this to your domain
+    allow_origins=[
+        "https://allisonmarx.com"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 # --- End of middleware section ---
 
