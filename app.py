@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware # Import the middleware
 import httpx
 import os
 import random
+import json
+import yt_dlp
 
 app = FastAPI()
 
@@ -117,3 +119,64 @@ async def proxy(request: Request, url: str = Query(...)):
         if not client.is_closed:
             await client.aclose()
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Transcript endpoint (added Nov 2026)
+# Hugging Face blocks YouTube from inside Spaces, so the Space asks this
+# service for transcripts instead. yt-dlp runs here and reaches YouTube
+# through the Webshare rotating residential proxy.
+# ---------------------------------------------------------------------------
+WEBSHARE_UN = os.environ.get("WEBSHARE_PROXY_UN", "")
+WEBSHARE_PW = os.environ.get("WEBSHARE_PROXY_PW", "")
+WEBSHARE_PROXY = (
+    f"http://{WEBSHARE_UN}:{WEBSHARE_PW}@p.webshare.io:80"
+    if (WEBSHARE_UN and WEBSHARE_PW) else None
+)
+TRANSCRIPT_TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "")
+MAX_TRANSCRIPT_CHARS = 8000
+
+
+def _scrub(msg):
+    msg = str(msg)
+    for secret in (WEBSHARE_PW, WEBSHARE_UN):
+        if secret:
+            msg = msg.replace(secret, "***")
+    return msg
+
+
+def _track_text(ydl, track):
+    url = next((f["url"] for f in track if f.get("ext") == "json3"), track[0]["url"])
+    data = json.loads(ydl.urlopen(url).read().decode("utf-8"))
+    parts = [s.get("utf8", "") for e in data.get("events", []) for s in (e.get("segs") or [])]
+    return "".join(parts).replace("\n", " ").strip()[:MAX_TRANSCRIPT_CHARS]
+
+
+@app.get("/transcript/{video_id}")
+def transcript(video_id: str, request: Request, langs: str = "en"):
+    if TRANSCRIPT_TOKEN and request.headers.get("x-token") != TRANSCRIPT_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-token header.")
+    opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "extractor_retries": 2,
+        "remote_components": ["ejs:github"],  # YouTube JS challenge solver (uses deno)
+    }
+    if WEBSHARE_PROXY:
+        opts["proxy"] = WEBSHARE_PROXY
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            subs = info.get("subtitles") or {}
+            auto = info.get("automatic_captions") or {}
+            out = {}
+            for lang in [l.strip() for l in langs.split(",") if l.strip()]:
+                track = subs.get(lang) or auto.get(lang) or auto.get(f"{lang}-en")
+                out[lang] = _track_text(ydl, track) if track else ""
+            return out
+    except Exception as e:
+        msg = _scrub(e)
+        print(f"Transcript fetch failed for {video_id}: {msg}")
+        raise HTTPException(status_code=502, detail=f"YouTube fetch failed: {msg}")
