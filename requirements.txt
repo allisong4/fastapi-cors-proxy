@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 httpx
+yt-dlp[default]==2026.7.4
+deno
