@@ -164,15 +164,31 @@ def _scrub(msg):
     return msg
 
 
-def _track_text(ydl, track):
+def _track_data(ydl, track):
+    """Download a caption track; return (plain_text, timed_segments).
+
+    timed_segments is a list of {"start": sec, "end": sec, "text": str} taken
+    from YouTube's json3 caption format, used by the Space to line the
+    translated speech up with the video (silence where nobody is talking).
+    """
     url = next((f["url"] for f in track if f.get("ext") == "json3"), track[0]["url"])
     data = json.loads(ydl.urlopen(url).read().decode("utf-8"))
-    parts = [s.get("utf8", "") for e in data.get("events", []) for s in (e.get("segs") or [])]
-    return "".join(parts).replace("\n", " ").strip()[:MAX_TRANSCRIPT_CHARS]
+    parts, segments = [], []
+    for e in data.get("events", []):
+        segs = e.get("segs") or []
+        line = "".join(s.get("utf8", "") for s in segs)
+        parts.append(line)
+        clean = line.replace("\n", " ").strip()
+        if clean and "tStartMs" in e:
+            start = e["tStartMs"] / 1000.0
+            end = start + (e.get("dDurationMs") or 0) / 1000.0
+            segments.append({"start": round(start, 3), "end": round(end, 3), "text": clean})
+    text = "".join(parts).replace("\n", " ").strip()[:MAX_TRANSCRIPT_CHARS]
+    return text, segments
 
 
 @app.get("/transcript/{video_id}")
-def transcript(video_id: str, request: Request, langs: str = "en"):
+def transcript(video_id: str, request: Request, langs: str = "en", segments: int = 0):
     if TRANSCRIPT_TOKEN and request.headers.get("x-token") != TRANSCRIPT_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing x-token header.")
     opts = {
@@ -194,22 +210,29 @@ def transcript(video_id: str, request: Request, langs: str = "en"):
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 subs = info.get("subtitles") or {}
                 auto = info.get("automatic_captions") or {}
-                out = {}
+                out, timed = {}, {}
                 for lang in [l.strip() for l in langs.split(",") if l.strip()]:
                     if lang == "en":
                         # English: human captions first, then YouTube's auto-captions.
                         track = subs.get("en") or auto.get("en") or auto.get("en-orig")
-                        out[lang] = _track_text(ydl, track) if track else ""
+                        if track:
+                            out[lang], timed[lang] = _track_data(ydl, track)
+                        else:
+                            out[lang], timed[lang] = "", []
                     else:
                         # Other languages: human-made captions ONLY. YouTube's
                         # machine-translated tracks get rate-limited (HTTP 429), and
                         # the Space translates from English anyway when this is "".
                         track = subs.get(lang)
-                        try:
-                            out[lang] = _track_text(ydl, track) if track else ""
-                        except Exception as e:
-                            print(f"Optional {lang} track failed for {video_id}: {_scrub(e)}", flush=True)
-                            out[lang] = ""
+                        out[lang], timed[lang] = "", []
+                        if track:
+                            try:
+                                out[lang], timed[lang] = _track_data(ydl, track)
+                            except Exception as e:
+                                print(f"Optional {lang} track failed for {video_id}: {_scrub(e)}", flush=True)
+                if segments:
+                    out["_segments"] = timed
+                    out["_duration"] = info.get("duration")
                 return out
         except Exception as e:
             last_msg = _scrub(e)
