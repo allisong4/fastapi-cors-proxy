@@ -136,6 +136,13 @@ WEBSHARE_PROXY = (
 TRANSCRIPT_TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "")
 MAX_TRANSCRIPT_CHARS = 8000
 
+print(
+    "Transcript endpoint: Webshare proxy "
+    + ("CONFIGURED (user ends with -rotate: %s)" % WEBSHARE_UN.endswith("-rotate") if WEBSHARE_PROXY else "NOT configured - YouTube will bot-block Render's IP")
+    + "; TRANSCRIPT_TOKEN " + ("set" if TRANSCRIPT_TOKEN else "NOT set"),
+    flush=True,
+)
+
 
 def _scrub(msg):
     msg = str(msg)
@@ -166,17 +173,33 @@ def transcript(video_id: str, request: Request, langs: str = "en"):
     }
     if WEBSHARE_PROXY:
         opts["proxy"] = WEBSHARE_PROXY
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            subs = info.get("subtitles") or {}
-            auto = info.get("automatic_captions") or {}
-            out = {}
-            for lang in [l.strip() for l in langs.split(",") if l.strip()]:
-                track = subs.get(lang) or auto.get(lang) or auto.get(f"{lang}-en")
-                out[lang] = _track_text(ydl, track) if track else ""
-            return out
-    except Exception as e:
-        msg = _scrub(e)
-        print(f"Transcript fetch failed for {video_id}: {msg}")
-        raise HTTPException(status_code=502, detail=f"YouTube fetch failed: {msg}")
+    last_msg = ""
+    for attempt in range(3):  # each attempt opens new connections -> new Webshare IP
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                subs = info.get("subtitles") or {}
+                auto = info.get("automatic_captions") or {}
+                out = {}
+                for lang in [l.strip() for l in langs.split(",") if l.strip()]:
+                    if lang == "en":
+                        # English: human captions first, then YouTube's auto-captions.
+                        track = subs.get("en") or auto.get("en") or auto.get("en-orig")
+                        out[lang] = _track_text(ydl, track) if track else ""
+                    else:
+                        # Other languages: human-made captions ONLY. YouTube's
+                        # machine-translated tracks get rate-limited (HTTP 429), and
+                        # the Space translates from English anyway when this is "".
+                        track = subs.get(lang)
+                        try:
+                            out[lang] = _track_text(ydl, track) if track else ""
+                        except Exception as e:
+                            print(f"Optional {lang} track failed for {video_id}: {_scrub(e)}", flush=True)
+                            out[lang] = ""
+                return out
+        except Exception as e:
+            last_msg = _scrub(e)
+            print(f"Transcript attempt {attempt + 1}/3 failed for {video_id}: {last_msg}", flush=True)
+            if "not a bot" not in last_msg and "429" not in last_msg:
+                break
+    raise HTTPException(status_code=502, detail=f"YouTube fetch failed: {last_msg}")
