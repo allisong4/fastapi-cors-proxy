@@ -136,10 +136,22 @@ WEBSHARE_PROXY = (
 TRANSCRIPT_TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "")
 MAX_TRANSCRIPT_CHARS = 8000
 
+# yt-dlp needs a JavaScript runtime (deno) to solve YouTube's player challenge.
+# Without it YouTube answers "This video is not available". The `deno` pip
+# package ships the binary inside site-packages, which may not be on PATH, so
+# point yt-dlp at it explicitly.
+import shutil
+try:
+    import deno as _deno_pkg
+    DENO_PATH = _deno_pkg.find_deno_bin()
+except Exception:
+    DENO_PATH = shutil.which("deno")
+
 print(
     "Transcript endpoint: Webshare proxy "
     + ("CONFIGURED (user ends with -rotate: %s)" % WEBSHARE_UN.endswith("-rotate") if WEBSHARE_PROXY else "NOT configured - YouTube will bot-block Render's IP")
-    + "; TRANSCRIPT_TOKEN " + ("set" if TRANSCRIPT_TOKEN else "NOT set"),
+    + "; TRANSCRIPT_TOKEN " + ("set" if TRANSCRIPT_TOKEN else "NOT set")
+    + "; deno " + (DENO_PATH or "NOT FOUND"),
     flush=True,
 )
 
@@ -166,13 +178,15 @@ def transcript(video_id: str, request: Request, langs: str = "en"):
     opts = {
         "skip_download": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,  # keep warnings so JS-runtime problems show in Render logs
         "socket_timeout": 15,
         "extractor_retries": 2,
         "remote_components": ["ejs:github"],  # YouTube JS challenge solver (uses deno)
     }
     if WEBSHARE_PROXY:
         opts["proxy"] = WEBSHARE_PROXY
+    if DENO_PATH:
+        opts["js_runtimes"] = {"deno": {"path": DENO_PATH}}
     last_msg = ""
     for attempt in range(3):  # each attempt opens new connections -> new Webshare IP
         try:
@@ -200,6 +214,7 @@ def transcript(video_id: str, request: Request, langs: str = "en"):
         except Exception as e:
             last_msg = _scrub(e)
             print(f"Transcript attempt {attempt + 1}/3 failed for {video_id}: {last_msg}", flush=True)
-            if "not a bot" not in last_msg and "429" not in last_msg:
+            retryable = ("not a bot", "429", "not available", "timed out", "EOF")
+            if not any(r in last_msg for r in retryable):
                 break
     raise HTTPException(status_code=502, detail=f"YouTube fetch failed: {last_msg}")
